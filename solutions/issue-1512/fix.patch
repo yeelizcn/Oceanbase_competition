@@ -1,0 +1,311 @@
+diff --git a/src/sql/resolver/dml/ob_inlist_resolver.cpp b/src/sql/resolver/dml/ob_inlist_resolver.cpp
+index f832a9ef..1730f6e2 100644
+--- a/src/sql/resolver/dml/ob_inlist_resolver.cpp
++++ b/src/sql/resolver/dml/ob_inlist_resolver.cpp
+@@ -20,6 +20,7 @@
+ #include "sql/resolver/dml/ob_dml_resolver.h"
+ #include "sql/engine/expr/ob_expr_version.h"
+ #include "sql/rewrite/ob_transform_pre_process.h"
++#include "lib/hash/ob_hashset.h"
+ 
+ namespace oceanbase
+ {
+@@ -263,6 +264,60 @@ int ObInListResolver::get_inlist_rewrite_info(const ParseNode &in_list,
+   return ret;
+ }
+ 
++// Count only values whose equality is independent of SQL casts and collations.
++// This is a costing decision: keep every original element/parameter so a cached
++// plan remains correct when the same parameterized SQL has different values.
++static int has_few_distinct_integer_values(const ParseNode &in_list,
++                                         const ParamStore *param_store,
++                                         const int64_t threshold,
++                                         bool &has_few_values)
++{
++  int ret = OB_SUCCESS;
++  has_few_values = false;
++  hash::ObHashSet<ObObj> values;
++  bool supported = true;
++  if (OB_ISNULL(in_list.children_)) {
++    ret = OB_ERR_UNEXPECTED;
++  }
++  for (int64_t i = 0; OB_SUCC(ret) && supported && values.size() < threshold
++                        && i < in_list.num_child_; ++i) {
++    const ParseNode *node = in_list.children_[i];
++    ObObj value;
++    if (OB_ISNULL(node)) {
++      ret = OB_ERR_UNEXPECTED;
++    } else if (T_INT == node->type_) {
++      value.set_int(node->value_);
++    } else if (T_UINT64 == node->type_) {
++      value.set_uint64(static_cast<uint64_t>(node->value_));
++    } else if (T_NULL == node->type_) {
++      value.set_null();
++    } else if (T_QUESTIONMARK == node->type_ && NULL != param_store
++               && node->value_ >= 0 && node->value_ < param_store->count()) {
++      value = param_store->at(node->value_);
++      supported = value.is_integer_type() || value.is_null();
++    } else {
++      supported = false;
++    }
++    if (OB_SUCC(ret) && supported) {
++      if (!values.created()
++          && OB_FAIL(values.create(hash::cal_next_prime(threshold),
++                                   "InListNDV", "InListNDV"))) {
++        LOG_WARN("failed to create in-list value set", K(ret));
++      } else if (OB_FAIL(values.set_refactored(value))) {
++        if (OB_HASH_EXIST == ret) {
++          ret = OB_SUCCESS;
++        } else {
++          LOG_WARN("failed to add in-list value", K(ret));
++        }
++      }
++    }
++  }
++  if (OB_SUCC(ret)) {
++    has_few_values = supported && values.size() < threshold;
++  }
++  return ret;
++}
++
+ int ObInListResolver::check_inlist_rewrite_enable(const ParseNode &in_list,
+                                                   const ObItemType op_type,
+                                                   const ObRawExpr &left_expr,
+@@ -351,6 +406,16 @@ int ObInListResolver::check_inlist_rewrite_enable(const ParseNode &in_list,
+       }
+       is_question_mark = rewrite_info.is_question_mark_;
+     }
++    if (OB_SUCC(ret) && is_enable && column_cnt == 1
++        && !is_prepare_stmt && threshold > 1) {
++      bool has_few_values = false;
++      if (OB_FAIL(has_few_distinct_integer_values(in_list, param_store, threshold,
++                                                 has_few_values))) {
++        LOG_WARN("failed to check in-list distinct values", K(ret));
++      } else if (has_few_values) {
++        is_enable = false;
++      }
++    }
+   }
+   return ret;
+ }
+diff --git a/tools/deploy/mysql_test/test_suite/expr/r/mysql/integer_inlist_rewrite.result b/tools/deploy/mysql_test/test_suite/expr/r/mysql/integer_inlist_rewrite.result
+new file mode 100644
+index 00000000..c8f2270c
+--- /dev/null
++++ b/tools/deploy/mysql_test/test_suite/expr/r/mysql/integer_inlist_rewrite.result
+@@ -0,0 +1,151 @@
++drop table if exists integer_inlist_rewrite;
++create table integer_inlist_rewrite (id int primary key, v bigint unsigned);
++insert into integer_inlist_rewrite values
++(1,1),(2,2),(3,3),(4,4),(5,5),(6,NULL),(7,18446744073709551615);
++# Three distinct integers below the threshold must remain an IN filter.
++explain basic select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in (1,2,3,1,2,3,1,2,3);
++Query Plan
++===========================================
++|ID|OPERATOR       |NAME                  |
++-------------------------------------------
++|0 |TABLE FULL SCAN|integer_inlist_rewrite|
++===========================================
++Outputs & filters:
++-------------------------------------
++  0 - output([integer_inlist_rewrite.id]), filter([integer_inlist_rewrite.v IN (1, 2, 3, 1, 2, 3, 1, 2, 3)]), rowset=16
++      access([integer_inlist_rewrite.id], [integer_inlist_rewrite.v]), partitions(p0)
++      is_index_back=false, is_global_index=false, filter_before_indexback[false], 
++      range_key([integer_inlist_rewrite.id]), range(MIN ; MAX)always true
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in (1,2,3,1,2,3,1,2,3) order by id;
++id
++1
++2
++3
++# Same parameterized shape, different values: no parameter may be removed.
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in (1,2,3,4,5,4,5,4,5) order by id;
++id
++1
++2
++3
++4
++5
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in (1,2,3,1,2,3,1,2,3) order by id;
++id
++1
++2
++3
++# The threshold boundary and explicitly forced rewrite still apply.
++explain basic select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in (1,2,3,4,1,2,3,4);
++Query Plan
++=====================================================
++|ID|OPERATOR                 |NAME                  |
++-----------------------------------------------------
++|0 |HASH JOIN                |                      |
++|1 |├─SUBPLAN SCAN           |VIEW2                 |
++|2 |│ └─HASH DISTINCT        |                      |
++|3 |│   └─VALUES TABLE ACCESS|VALUES_TABLE1         |
++|4 |└─TABLE FULL SCAN        |integer_inlist_rewrite|
++=====================================================
++Outputs & filters:
++-------------------------------------
++  0 - output([integer_inlist_rewrite.id]), filter(nil), rowset=16
++      equal_conds([integer_inlist_rewrite.v = VIEW2.column_0]), other_conds(nil)
++  1 - output([VIEW2.column_0]), filter(nil), rowset=16
++      access([VIEW2.column_0])
++  2 - output([VALUES_TABLE1.column_0]), filter(nil), rowset=16
++      distinct([VALUES_TABLE1.column_0])
++  3 - output([VALUES_TABLE1.column_0]), filter(nil)
++      access([VALUES_TABLE1.column_0])
++  4 - output([integer_inlist_rewrite.id], [integer_inlist_rewrite.v]), filter(nil), rowset=16
++      access([integer_inlist_rewrite.id], [integer_inlist_rewrite.v]), partitions(p0)
++      is_index_back=false, is_global_index=false, 
++      range_key([integer_inlist_rewrite.id]), range(MIN ; MAX)always true
++explain basic select /*+ opt_param('inlist_rewrite_threshold', 1) */ id
++from integer_inlist_rewrite where v in (1,1,1,1);
++Query Plan
++=====================================================
++|ID|OPERATOR                 |NAME                  |
++-----------------------------------------------------
++|0 |HASH JOIN                |                      |
++|1 |├─SUBPLAN SCAN           |VIEW2                 |
++|2 |│ └─HASH DISTINCT        |                      |
++|3 |│   └─VALUES TABLE ACCESS|VALUES_TABLE1         |
++|4 |└─TABLE FULL SCAN        |integer_inlist_rewrite|
++=====================================================
++Outputs & filters:
++-------------------------------------
++  0 - output([integer_inlist_rewrite.id]), filter(nil), rowset=16
++      equal_conds([integer_inlist_rewrite.v = VIEW2.column_0]), other_conds(nil)
++  1 - output([VIEW2.column_0]), filter(nil), rowset=16
++      access([VIEW2.column_0])
++  2 - output([VALUES_TABLE1.column_0]), filter(nil), rowset=16
++      distinct([VALUES_TABLE1.column_0])
++  3 - output([VALUES_TABLE1.column_0]), filter(nil)
++      access([VALUES_TABLE1.column_0])
++  4 - output([integer_inlist_rewrite.id], [integer_inlist_rewrite.v]), filter(nil), rowset=16
++      access([integer_inlist_rewrite.id], [integer_inlist_rewrite.v]), partitions(p0)
++      is_index_back=false, is_global_index=false, 
++      range_key([integer_inlist_rewrite.id]), range(MIN ; MAX)always true
++# NULL must preserve three-valued IN and NOT IN semantics.
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in (1,NULL,1,NULL,1,NULL) order by id;
++id
++1
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v not in (1,NULL,1,NULL,1,NULL) order by id;
++id
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in (NULL,NULL,NULL,NULL) order by id;
++id
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v not in (1,2,3,1,2,3) order by id;
++id
++4
++5
++7
++# Unsigned boundary values must not be truncated to signed integers.
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite
++where v in (18446744073709551615,18446744073709551615,
++18446744073709551615,18446744073709551615) order by id;
++id
++7
++# Strings, decimal literals and row values keep the existing path.
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in ('1','2','1','2') order by id;
++id
++1
++2
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in (1.5,2.0,1.5,2.0) order by id;
++id
++2
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where (id,v) in ((1,1),(2,2),(1,1),(2,2)) order by id;
++id
++1
++2
++# Prepared statements must retain every independently bound parameter.
++prepare inlist_stmt from
++'select /*+ opt_param(''inlist_rewrite_threshold'', 4) */ id from integer_inlist_rewrite where v in (?,?,?,?,?,?) order by id';
++set @a=1, @b=2, @c=3, @d=1, @e=2, @f=3;
++execute inlist_stmt using @a,@b,@c,@d,@e,@f;
++id
++1
++2
++3
++set @d=4, @e=5, @f=NULL;
++execute inlist_stmt using @a,@b,@c,@d,@e,@f;
++id
++1
++2
++3
++4
++5
++deallocate prepare inlist_stmt;
++drop table integer_inlist_rewrite;
+diff --git a/tools/deploy/mysql_test/test_suite/expr/t/integer_inlist_rewrite.test b/tools/deploy/mysql_test/test_suite/expr/t/integer_inlist_rewrite.test
+new file mode 100644
+index 00000000..f4fe673d
+--- /dev/null
++++ b/tools/deploy/mysql_test/test_suite/expr/t/integer_inlist_rewrite.test
+@@ -0,0 +1,58 @@
++--disable_warnings
++drop table if exists integer_inlist_rewrite;
++--enable_warnings
++create table integer_inlist_rewrite (id int primary key, v bigint unsigned);
++insert into integer_inlist_rewrite values
++  (1,1),(2,2),(3,3),(4,4),(5,5),(6,NULL),(7,18446744073709551615);
++
++--echo # Three distinct integers below the threshold must remain an IN filter.
++explain basic select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in (1,2,3,1,2,3,1,2,3);
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in (1,2,3,1,2,3,1,2,3) order by id;
++
++--echo # Same parameterized shape, different values: no parameter may be removed.
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in (1,2,3,4,5,4,5,4,5) order by id;
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in (1,2,3,1,2,3,1,2,3) order by id;
++
++--echo # The threshold boundary and explicitly forced rewrite still apply.
++explain basic select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in (1,2,3,4,1,2,3,4);
++explain basic select /*+ opt_param('inlist_rewrite_threshold', 1) */ id
++from integer_inlist_rewrite where v in (1,1,1,1);
++
++--echo # NULL must preserve three-valued IN and NOT IN semantics.
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in (1,NULL,1,NULL,1,NULL) order by id;
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v not in (1,NULL,1,NULL,1,NULL) order by id;
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in (NULL,NULL,NULL,NULL) order by id;
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v not in (1,2,3,1,2,3) order by id;
++
++--echo # Unsigned boundary values must not be truncated to signed integers.
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite
++where v in (18446744073709551615,18446744073709551615,
++            18446744073709551615,18446744073709551615) order by id;
++
++--echo # Strings, decimal literals and row values keep the existing path.
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in ('1','2','1','2') order by id;
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where v in (1.5,2.0,1.5,2.0) order by id;
++select /*+ opt_param('inlist_rewrite_threshold', 4) */ id
++from integer_inlist_rewrite where (id,v) in ((1,1),(2,2),(1,1),(2,2)) order by id;
++
++--echo # Prepared statements must retain every independently bound parameter.
++prepare inlist_stmt from
++  'select /*+ opt_param(''inlist_rewrite_threshold'', 4) */ id from integer_inlist_rewrite where v in (?,?,?,?,?,?) order by id';
++set @a=1, @b=2, @c=3, @d=1, @e=2, @f=3;
++execute inlist_stmt using @a,@b,@c,@d,@e,@f;
++set @d=4, @e=5, @f=NULL;
++execute inlist_stmt using @a,@b,@c,@d,@e,@f;
++deallocate prepare inlist_stmt;
++drop table integer_inlist_rewrite;
